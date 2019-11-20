@@ -46,7 +46,7 @@ CMD -url ... /app
 The `treksler/await:scratch` image is a base image based on `scratch`.  `await` is installed in the `$PATH` and can be used directly.
 
 ```
-FROM treksler/await
+FROM treksler/await:scratch
 ...
 COPY app /app
 ...
