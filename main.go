@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -11,11 +12,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
-const defaultWaitRetryInterval = time.Second
+const defaultRetryInterval = time.Second
+const defaultRetryBackoffMaxInterval = 300 * time.Second
+var retryBackoffMaxInterval = defaultRetryBackoffMaxInterval
 
 type sliceVar []string
 type hostFlagsVar []string
@@ -38,28 +39,24 @@ func (c *Context) Env() map[string]string {
 }
 
 var (
-	buildVersion string
-	version      bool
-	poll         bool
-	wg           sync.WaitGroup
+	buildVersion 		string
+	version      		bool
+	poll	 		bool
+	wg	   		sync.WaitGroup
 
-	templatesFlag     sliceVar
-	templateDirsFlag  sliceVar
-	stdoutTailFlag    sliceVar
-	stderrTailFlag    sliceVar
-	headersFlag       sliceVar
-	delimsFlag        string
-	delims            []string
-	headers           []HttpHeader
-	urls              []url.URL
-	waitFlag          hostFlagsVar
-	waitRetryInterval time.Duration
-	waitTimeoutFlag   time.Duration
-	dependencyChan    chan struct{}
-	noOverwriteFlag   bool
+	headersFlag     	sliceVar
+	presentFlag     	sliceVar
+	absentFlag		sliceVar
+	headers	   		[]HttpHeader
+	urls	      		[]url.URL
+	present	   		[]string
+	absent	    		[]string
+	hostFlag		hostFlagsVar
+	retryInterval 		time.Duration
+	retryBackoffFlag 	bool
+	timeoutFlag   		time.Duration
+	dependencyChan  	chan struct{}
 
-	ctx    context.Context
-	cancel context.CancelFunc
 )
 
 func (i *hostFlagsVar) String() string {
@@ -80,19 +77,19 @@ func (s *sliceVar) String() string {
 	return strings.Join(*s, ",")
 }
 
-func waitForDependencies() {
+func awaitForDependencies() {
 	dependencyChan := make(chan struct{})
 
 	go func() {
 		for _, u := range urls {
-			log.Println("Waiting for:", u.String())
+			log.Println("Awaiting for:", u.String())
 
 			switch u.Scheme {
 			case "file":
 				wg.Add(1)
 				go func(u url.URL) {
 					defer wg.Done()
-					ticker := time.NewTicker(waitRetryInterval)
+					ticker := time.NewTicker(retryInterval)
 					defer ticker.Stop()
 					var err error
 					for range ticker.C {
@@ -102,28 +99,27 @@ func waitForDependencies() {
 						} else if os.IsNotExist(err) {
 							continue
 						} else {
-							log.Printf("Problem with check file %s exist: %v. Sleeping %s\n", u.String(), err.Error(), waitRetryInterval)
-
+							log.Printf("Problem with check file %s exist: %v. Sleeping %s\n", u.String(), err.Error(), retryInterval)
 						}
 					}
 				}(u)
 			case "tcp", "tcp4", "tcp6":
-				waitForSocket(u.Scheme, u.Host, waitTimeoutFlag)
+				awaitForSocket(u.Scheme, u.Host, timeoutFlag)
 			case "unix":
-				waitForSocket(u.Scheme, u.Path, waitTimeoutFlag)
+				awaitForSocket(u.Scheme, u.Path, timeoutFlag)
 			case "http", "https":
 				wg.Add(1)
 				go func(u url.URL) {
 					client := &http.Client{
-						Timeout: waitTimeoutFlag,
+						Timeout: timeoutFlag,
 					}
-
+					
 					defer wg.Done()
 					for {
 						req, err := http.NewRequest("GET", u.String(), nil)
 						if err != nil {
-							log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), waitRetryInterval)
-							time.Sleep(waitRetryInterval)
+							log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), retryInterval)
+							time.Sleep(retryInterval)
 						}
 						if len(headers) > 0 {
 							for _, header := range headers {
@@ -133,14 +129,64 @@ func waitForDependencies() {
 
 						resp, err := client.Do(req)
 						if err != nil {
-							log.Printf("Problem with request: %s. Sleeping %s\n", err.Error(), waitRetryInterval)
-							time.Sleep(waitRetryInterval)
+							log.Printf("Problem with request: %s. Sleeping %s\n", err.Error(), retryInterval)
+							time.Sleep(retryInterval)
 						} else if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 							log.Printf("Received %d from %s\n", resp.StatusCode, u.String())
-							return
+							if len(present) == 0 && len(absent) == 0 {
+								return
+							}
+							defer resp.Body.Close()
+							body, err := ioutil.ReadAll(resp.Body)
+							if err != nil {
+								log.Printf("Problem reading request body: %s", err.Error())
+							}
+							// log.Printf("BODY: %s\n", string(body))
+							var requiredTextNotFound = 0
+							var forbiddenTextFound = 0
+							if len(present) > 0 {
+								for _, p := range present {
+									//log.Printf("PRESENT TEXT: %s\n", p)
+									if strings.Contains(string(body), p) {
+										log.Printf(" - Found required text: %s\n", p)
+									} else {
+										log.Printf(" - Required text not found: %s\n", p)
+										requiredTextNotFound = 1
+									}
+								}
+							}
+							if len(absent) > 0 {
+								for _, a := range absent {
+									//log.Printf("ABSENT TEXT: %s\n", a)
+									if strings.Contains(string(body), a) {
+										log.Printf(" - Found forbidden text: %s\n", a)
+										forbiddenTextFound = 1
+									} else {
+										log.Printf(" - Forbidden text not found: %s\n", a)
+									}
+								}
+							}
+							if requiredTextNotFound == 0 && forbiddenTextFound == 0 {
+								return
+							} else {
+								if requiredTextNotFound == 1 {
+									log.Printf("NOT all required text was found.")
+								}
+								if forbiddenTextFound == 1 {
+									log.Printf("At least some forbidden text was found.")
+								}
+								log.Printf("Sleeping %s\n", retryInterval)
+								time.Sleep(retryInterval)
+							}
 						} else {
-							log.Printf("Received %d from %s. Sleeping %s\n", resp.StatusCode, u.String(), waitRetryInterval)
-							time.Sleep(waitRetryInterval)
+							log.Printf("Received %d from %s. Sleeping %s\n", resp.StatusCode, u.String(), retryInterval)
+							time.Sleep(retryInterval)
+						}
+						if retryBackoffFlag == true {
+							retryInterval += retryInterval
+							if retryInterval > retryBackoffMaxInterval {
+								retryInterval = retryBackoffMaxInterval
+							}
 						}
 					}
 				}(u)
@@ -155,21 +201,27 @@ func waitForDependencies() {
 	select {
 	case <-dependencyChan:
 		break
-	case <-time.After(waitTimeoutFlag):
-		log.Fatalf("Timeout after %s waiting on dependencies to become available: %v", waitTimeoutFlag, waitFlag)
+	case <-time.After(timeoutFlag):
+		log.Fatalf("Timeout after %s awaiting on dependencies to become available: %v", timeoutFlag, hostFlag)
 	}
 
 }
 
-func waitForSocket(scheme, addr string, timeout time.Duration) {
+func awaitForSocket(scheme, addr string, timeout time.Duration) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for {
-			conn, err := net.DialTimeout(scheme, addr, waitTimeoutFlag)
+			conn, err := net.DialTimeout(scheme, addr, timeoutFlag)
 			if err != nil {
-				log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), waitRetryInterval)
-				time.Sleep(waitRetryInterval)
+				log.Printf("Problem with dial: %v. Sleeping %s\n", err.Error(), retryInterval)
+				time.Sleep(retryInterval)
+			}
+			if retryBackoffFlag == true {
+				retryInterval += retryInterval
+				if retryInterval > retryBackoffMaxInterval {
+					retryInterval = retryBackoffMaxInterval
+				}
 			}
 			if conn != nil {
 				log.Printf("Connected to %s://%s\n", scheme, addr)
@@ -180,9 +232,9 @@ func waitForSocket(scheme, addr string, timeout time.Duration) {
 }
 
 func usage() {
-	println(`Usage: dockerize [options] [command]
+	println(`Usage: await [options] [command]
 
-Utility to simplify running applications in docker containers
+Utility to wait for a socket, an http(s) response or a file before launching a command
 
 Options:`)
 	flag.PrintDefaults()
@@ -194,32 +246,32 @@ Arguments:
 
 	println(`Examples:
 `)
-	println(`   Generate /etc/nginx/nginx.conf using nginx.tmpl as a template, tail /var/log/nginx/access.log
-   and /var/log/nginx/error.log, waiting for a website to become available on port 8000 and start nginx.`)
-	println(`
-   dockerize -template nginx.tmpl:/etc/nginx/nginx.conf \
-             -stdout /var/log/nginx/access.log \
-             -stderr /var/log/nginx/error.log \
-             -wait tcp://web:8000 nginx
-	`)
+	println(` - Wait for a database to become available on port 5432 and start nginx.`)
+	println(`     await -url tcp://db:5432 nginx
+`)
+	println(` - Wait for a website to become available on port 8000 and start nginx.`)
+	println(`     await -url http://web:8000 nginx
+`)
+	println(` - Wait 90s for a website to become available on port 38383, look for text "ready" and make sure text "fail" is not present. Retry after 5,10,20,40,80,80,etc. seconds and start nginx.`)
+	println(`     await --url http://localhost:38383 --text-present "ready" --text-absent "fail" --timeout 300s --retry-interval 5s --retry-backoff --retry-backoff-max-interval 80s
+`)
 
-	println(`For more information, see https://github.com/jwilder/dockerize`)
+	println(`For more information, see https://github.com/treksler/await`)
 }
 
 func main() {
 
 	flag.BoolVar(&version, "version", false, "show version")
-	flag.BoolVar(&poll, "poll", false, "enable polling")
 
-	flag.Var(&templatesFlag, "template", "Template (/template:/dest). Can be passed multiple times. Does also support directories")
-	flag.BoolVar(&noOverwriteFlag, "no-overwrite", false, "Do not overwrite destination file if it already exists.")
-	flag.Var(&stdoutTailFlag, "stdout", "Tails a file to stdout. Can be passed multiple times")
-	flag.Var(&stderrTailFlag, "stderr", "Tails a file to stderr. Can be passed multiple times")
-	flag.StringVar(&delimsFlag, "delims", "", `template tag delimiters. default "{{":"}}" `)
-	flag.Var(&headersFlag, "wait-http-header", "HTTP headers, colon separated. e.g \"Accept-Encoding: gzip\". Can be passed multiple times")
-	flag.Var(&waitFlag, "wait", "Host (tcp/tcp4/tcp6/http/https/unix/file) to wait for before this container starts. Can be passed multiple times. e.g. tcp://db:5432")
-	flag.DurationVar(&waitTimeoutFlag, "timeout", 10*time.Second, "Host wait timeout")
-	flag.DurationVar(&waitRetryInterval, "wait-retry-interval", defaultWaitRetryInterval, "Duration to wait before retrying")
+	flag.Var(&headersFlag, "http-header", "HTTP headers, colon separated. e.g \"Accept-Encoding: gzip\". Can be passed multiple times")
+	flag.Var(&presentFlag, "text-present", "Text required text to be present in HTTP response body. Can be passed multiple times")
+	flag.Var(&absentFlag, "text-absent", "Text required to be absent from HTTP response body. Can be passed multiple times")
+	flag.Var(&hostFlag, "url", "Host (tcp/tcp4/tcp6/http/https/unix/file) to await before this container starts. Can be passed multiple times. e.g. tcp://db:5432")
+	flag.DurationVar(&timeoutFlag, "timeout", 10*time.Second, "URL wait timeout")
+	flag.DurationVar(&retryInterval, "retry-interval", defaultRetryInterval, "Duration to wait before retrying")
+      	flag.BoolVar(&retryBackoffFlag, "retry-backoff", false, "Double the retry time, with each iteration. (default: false)")
+	flag.DurationVar(&retryBackoffMaxInterval, "retry-backoff-max-interval", defaultRetryBackoffMaxInterval, "Maximum duration to wait before retrying, when retry backoff is enabled.")
+
 
 	flag.Usage = usage
 	flag.Parse()
@@ -229,19 +281,25 @@ func main() {
 		return
 	}
 
+	if retryBackoffFlag == true && retryInterval > retryBackoffMaxInterval {
+		log.Printf("Retry Interval %s exceeds maximum backoff retry interval of %s. Using %s\n", retryInterval, retryBackoffMaxInterval, retryBackoffMaxInterval)
+		retryInterval = retryBackoffMaxInterval
+	}
+
 	if flag.NArg() == 0 && flag.NFlag() == 0 {
 		usage()
 		os.Exit(1)
 	}
 
-	if delimsFlag != "" {
-		delims = strings.Split(delimsFlag, ":")
-		if len(delims) != 2 {
-			log.Fatalf("bad delimiters argument: %s. expected \"left:right\"", delimsFlag)
-		}
+	for _, p := range presentFlag {
+		present = append(present, p)
 	}
 
-	for _, host := range waitFlag {
+	for _, a := range absentFlag {
+		absent = append(absent, a)
+	}
+
+	for _, host := range hostFlag {
 		u, err := url.Parse(host)
 		if err != nil {
 			log.Fatalf("bad hostname provided: %s. %s", host, err.Error())
@@ -250,9 +308,9 @@ func main() {
 	}
 
 	for _, h := range headersFlag {
-		//validate headers need -wait options
-		if len(waitFlag) == 0 {
-			log.Fatalf("-wait-http-header \"%s\" provided with no -wait option", h)
+		//validate headers need -host options
+		if len(hostFlag) == 0 {
+			log.Fatalf("-http-header \"%s\" provided with no -host option", h)
 		}
 
 		const errMsg = "bad HTTP Headers argument: %s. expected \"headerName: headerValue\""
@@ -268,45 +326,11 @@ func main() {
 
 	}
 
-	for _, t := range templatesFlag {
-		template, dest := t, ""
-		if strings.Contains(t, ":") {
-			parts := strings.Split(t, ":")
-			if len(parts) != 2 {
-				log.Fatalf("bad template argument: %s. expected \"/template:/dest\"", t)
-			}
-			template, dest = parts[0], parts[1]
-		}
-
-		fi, err := os.Stat(template)
-		if err != nil {
-			log.Fatalf("unable to stat %s, error: %s", template, err)
-		}
-		if fi.IsDir() {
-			generateDir(template, dest)
-		} else {
-			generateFile(template, dest)
-		}
-	}
-
-	waitForDependencies()
-
-	// Setup context
-	ctx, cancel = context.WithCancel(context.Background())
+	awaitForDependencies()
 
 	if flag.NArg() > 0 {
 		wg.Add(1)
-		go runCmd(ctx, cancel, flag.Arg(0), flag.Args()[1:]...)
-	}
-
-	for _, out := range stdoutTailFlag {
-		wg.Add(1)
-		go tailFile(ctx, out, poll, os.Stdout)
-	}
-
-	for _, err := range stderrTailFlag {
-		wg.Add(1)
-		go tailFile(ctx, err, poll, os.Stderr)
+		go Exec(flag.Arg(0), flag.Args())
 	}
 
 	wg.Wait()
