@@ -106,6 +106,10 @@ HTTP headers, colon separated. e.g "Accept-Encoding: gzip". Can be passed multip
 $ await -url http://web:80 -http-header "Authorization:Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
 ```
 
+#### -http-insecure
+
+Allow connections to HTTPS sites without valid certs. (default: false)
+
 #### -retry-backoff
 
 Double the retry time, with each iteration. (default: false)

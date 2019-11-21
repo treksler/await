@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -54,6 +55,7 @@ var (
 	hostFlag		hostFlagsVar
 	retryInterval 		time.Duration
 	retryBackoffFlag 	bool
+	insecureFlag 		bool
 	timeoutFlag   		time.Duration
 	dependencyChan  	chan struct{}
 
@@ -110,8 +112,12 @@ func awaitForDependencies() {
 			case "http", "https":
 				wg.Add(1)
 				go func(u url.URL) {
+					tr := &http.Transport{
+						TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureFlag},
+					}
 					client := &http.Client{
 						Timeout: timeoutFlag,
+						Transport: tr,
 					}
 					
 					defer wg.Done()
@@ -270,6 +276,7 @@ func main() {
 	flag.DurationVar(&timeoutFlag, "timeout", 10*time.Second, "URL wait timeout")
 	flag.DurationVar(&retryInterval, "retry-interval", defaultRetryInterval, "Duration to wait before retrying")
       	flag.BoolVar(&retryBackoffFlag, "retry-backoff", false, "Double the retry time, with each iteration. (default: false)")
+	flag.BoolVar(&insecureFlag, "http-insecure", false, "Allow connections to HTTPS sites without valid certs. (default: false)")
 	flag.DurationVar(&retryBackoffMaxInterval, "retry-backoff-max-interval", defaultRetryBackoffMaxInterval, "Maximum duration to wait before retrying, when retry backoff is enabled.")
 
 
