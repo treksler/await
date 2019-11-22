@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -58,6 +60,9 @@ var (
 	insecureFlag 		bool
 	timeoutFlag   		time.Duration
 	dependencyChan  	chan struct{}
+	rootCAs			*x509.CertPool
+	cacerts			[][]byte
+	cacertFlag		sliceVar
 
 )
 
@@ -112,8 +117,24 @@ func awaitForDependencies() {
 			case "http", "https":
 				wg.Add(1)
 				go func(u url.URL) {
+					// Get the SystemCertPool, continue with an empty pool on error
+					rootCAs, _ := x509.SystemCertPool()
+					if rootCAs == nil {
+						rootCAs = x509.NewCertPool()
+					}
+
+					for _, ca := range cacerts {
+						ok := rootCAs.AppendCertsFromPEM(ca)
+						if !ok {
+							log.Fatalf("unable to use CA certificate %s", ca)
+						}
+					}
+
 					tr := &http.Transport{
-						TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureFlag},
+						TLSClientConfig: &tls.Config{
+							InsecureSkipVerify: insecureFlag,
+							RootCAs: rootCAs,
+						},
 					}
 					client := &http.Client{
 						Timeout: timeoutFlag,
@@ -270,8 +291,9 @@ func main() {
 	flag.BoolVar(&version, "version", false, "show version")
 
 	flag.Var(&headersFlag, "http-header", "HTTP headers, colon separated. e.g \"Accept-Encoding: gzip\". Can be passed multiple times")
-	flag.Var(&presentFlag, "text-present", "Text required text to be present in HTTP response body. Can be passed multiple times")
+	flag.Var(&presentFlag, "text-present", "Text required to be present in HTTP response body. Can be passed multiple times")
 	flag.Var(&absentFlag, "text-absent", "Text required to be absent from HTTP response body. Can be passed multiple times")
+	flag.Var(&cacertFlag, "http-cacert", "Base64 encoded Root CA certificate used to verify server certificate. Can be passed multiple times")
 	flag.Var(&hostFlag, "url", "Host (tcp/tcp4/tcp6/http/https/unix/file) to await before this container starts. Can be passed multiple times. e.g. tcp://db:5432")
 	flag.DurationVar(&timeoutFlag, "timeout", 10*time.Second, "URL wait timeout")
 	flag.DurationVar(&retryInterval, "retry-interval", defaultRetryInterval, "Duration to wait before retrying")
@@ -305,6 +327,15 @@ func main() {
 	for _, a := range absentFlag {
 		absent = append(absent, a)
 	}
+
+	for _, ca := range cacertFlag {
+		cert, err := base64.StdEncoding.DecodeString(ca)
+		if err != nil {
+			log.Fatalf("Error decoding cacert: %s %s", err, ca)
+		}
+		cacerts = append(cacerts, cert)
+	}
+
 
 	for _, host := range hostFlag {
 		u, err := url.Parse(host)

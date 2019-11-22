@@ -98,6 +98,10 @@ CMD await -url tcp://web:8000 nginx
 
 ### Command-line Options
 
+#### -http-cacert value
+
+Base64 encoded Root CA certificate used to verify server certificate. Can be passed multiple times
+
 #### -http-header value
   
 HTTP headers, colon separated. e.g "Accept-Encoding: gzip". Can be passed multiple times
