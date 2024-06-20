@@ -131,7 +131,7 @@ Duration to wait before retrying (default 1s)
 Text required to be absent from HTTP response body. Can be passed multiple times. The command will not run until none of the forbidden text is present in all http responses
 
 ```
-$ await -url tcp://db:5432 -url http://web:80 -text-present "not ready"
+$ await -url tcp://db:5432 -url http://web:80 -text-absent "not ready"
 ```
 
 #### -text-present value
